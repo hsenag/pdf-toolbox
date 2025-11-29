@@ -32,7 +32,6 @@ decode _ is = do
   -- Read all input and decode
   chunks <- Streams.toList is
   let input = ByteString.concat chunks
-      -- Preprocess: remove whitespace and end marker
       cleaned = preprocessASCII85 input
   case Base85.decode cleaned of
     Left (remaining, offset) ->
@@ -46,6 +45,7 @@ preprocessASCII85 input =
       noWhitespace = ByteString.filter (not . isSpace . toEnum . fromEnum) input
       -- Remove end marker (~>) if present
       stripped = case ByteString.breakSubstring "~>" noWhitespace of
-        (before, after) | ByteString.null after -> noWhitespace
-                       | otherwise -> before
+        (before, after)
+          | ByteString.null after -> noWhitespace
+          | otherwise -> before
   in stripped
