@@ -19,6 +19,7 @@ import Pdf.Core.Object
 import Pdf.Core.Parsers.Object
 import Pdf.Core.Stream.Filter.Type
 import Pdf.Core.Stream.Filter.FlateDecode
+import Pdf.Core.Stream.Filter.ASCII85Decode
 import Pdf.Core.IO.Buffer (Buffer)
 import qualified Pdf.Core.IO.Buffer as Buffer
 
@@ -50,9 +51,8 @@ readStream is off = do
 
 -- | All stream filters implemented by the toolbox
 --
--- Right now it contains only FlateDecode filter
 knownFilters :: [StreamFilter]
-knownFilters = catMaybes [flateDecode]
+knownFilters = catMaybes [flateDecode, ascii85Decode]
 
 -- | Raw stream content.
 -- Filters are not applyed
