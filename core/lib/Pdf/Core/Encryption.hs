@@ -30,6 +30,9 @@ import qualified System.IO.Streams as Streams
 import qualified Crypto.Cipher.RC4 as RC4
 import qualified Crypto.Cipher.AES as AES
 import qualified Crypto.Hash.MD5 as MD5
+import qualified Crypto.Hash.SHA256 as SHA256
+import qualified Crypto.Hash.SHA384 as SHA384
+import qualified Crypto.Hash.SHA512 as SHA512
 import qualified Crypto.Padding as Padding
 
 -- | Encryption handler may specify different encryption keys for strings
@@ -100,11 +103,17 @@ mkStandardDecryptor tr enc pass = do
       Just n -> intValue n `notice` "V should be an integer"
       _ -> Left "V is missing"
 
-  if v == 4
-    then mk4
-    else mk12 v
+  case v of
+    5 -> mk5
+    4 -> mk4
+    _ -> mk12 v
 
   where
+  -- The RC4/AESV2 handlers (V <= 4) pad the password to 32 bytes with the
+  -- standard padding string. The AESV3 handler (V == 5) uses the raw
+  -- password bytes instead, so it reads 'pass' directly.
+  pass32 = BS.take 32 (pass `mappend` defaultUserPassword)
+
   mk12 v = do
     n <-
       case v of
@@ -116,7 +125,7 @@ mkStandardDecryptor tr enc pass = do
             Nothing -> Left "Length is missing"
         _ -> Left ("Unsuported encryption handler version: " ++ show v)
 
-    ekey <- mkKey tr enc pass n
+    ekey <- mkKey tr enc pass32 n
     ok <- verifyKey tr enc ekey
     return $
       if not ok
@@ -143,7 +152,7 @@ mkStandardDecryptor tr enc pass = do
           "V2" -> return V2
           "AESV2" -> return AESV2
           _ -> Left $ "Unknown crypto method: " ++ show algName
-      ekey <- mkKey tr enc pass n
+      ekey <- mkKey tr enc pass32 n
       return (ekey, n, alg)
 
     (stdCfKey, _, _) <- HashMap.lookup "StdCF" keysMap
@@ -167,6 +176,72 @@ mkStandardDecryptor tr enc pass = do
           case scope of
             DecryptString -> mkDecryptor strFAlg strFKey strFN ref is
             DecryptStream -> mkDecryptor stmFAlg stmFKey stmFN ref is
+
+  -- Standard security handler, V5 (256-bit AES, /R 5 or 6). The file
+  -- encryption key is recovered from the user password and used directly
+  -- for every string and stream (no per-object key derivation).
+  mk5 = do
+    rVal <- (HashMap.lookup "R" enc >>= intValue)
+      `notice` "R should be an integer"
+    uVal <- (HashMap.lookup "U" enc >>= stringValue)
+      `notice` "U should be a string"
+    ueVal <- (HashMap.lookup "UE" enc >>= stringValue)
+      `notice` "UE should be a string"
+    unless (BS.length uVal >= 48) $
+      Left "U must be at least 48 bytes for V5 encryption"
+    unless (BS.length ueVal >= 32) $
+      Left "UE must be at least 32 bytes for V5 encryption"
+    let pw = BS.take 127 pass
+        validationSalt = BS.take 8 (BS.drop 32 uVal)
+        keySalt = BS.take 8 (BS.drop 40 uVal)
+        hashPass salt
+          | rVal == 5 = SHA256.hash (BS.concat [pw, salt])
+          | otherwise = hash2B pw salt BS.empty
+    if hashPass validationSalt /= BS.take 32 uVal
+      then return Nothing  -- password does not match the user password
+      else do
+        let intermediateKey = hashPass keySalt
+            fileKey = AES.decryptCBC (AES.initAES intermediateKey)
+                        (BS.replicate 16 0) (BS.take 32 ueVal)
+        return $ Just $ \_ref _scope is -> aesv3DecryptStream fileKey is
+
+-- | AESv3 (V5/R6) decryption. Every string and stream is decrypted with
+-- the file encryption key directly; the 16-byte CBC initialisation vector
+-- is prepended to the ciphertext.
+aesv3DecryptStream
+  :: ByteString                -- ^ 32-byte file encryption key
+  -> InputStream ByteString
+  -> IO (InputStream ByteString)
+aesv3DecryptStream key is = do
+  content <- BS.concat <$> Streams.toList is
+  if BS.length content <= 16
+    then Streams.fromByteString BS.empty
+    else do
+      let initV = BS.take 16 content
+          decrypted = AES.decryptCBC (AES.initAES key) initV (BS.drop 16 content)
+      Streams.fromByteString (Padding.unpadPKCS5 decrypted)
+
+-- | Algorithm 2.B from ISO 32000-2: the hardened hash used by the standard
+-- security handler for revision 6. Given the password, a salt and (for the
+-- owner password only) the 48-byte /U entry, it produces a 32-byte hash.
+hash2B :: ByteString -> ByteString -> ByteString -> ByteString
+hash2B pw salt udata =
+  go (0 :: Int) (SHA256.hash (BS.concat [pw, salt, udata]))
+  where
+  go n k =
+    let k1 = BS.concat (replicate 64 (BS.concat [pw, k, udata]))
+        e = AES.encryptCBC (AES.initAES (BS.take 16 k))
+                           (BS.take 16 (BS.drop 16 k)) k1
+        modulo = BS.foldl' (\acc w -> (acc * 256 + fromIntegral w) `mod` 3)
+                           (0 :: Int) (BS.take 16 e)
+        k' = case modulo of
+               0 -> SHA256.hash e
+               1 -> SHA384.hash e
+               _ -> SHA512.hash e
+        n' = n + 1
+    in if n' >= 64 && fromIntegral (BS.last e) <= n' - 32
+         then BS.take 32 k'
+         else go n' k'
 
 mkKey :: Dict -> Dict -> ByteString -> Int -> Either String ByteString
 mkKey tr enc pass n = do

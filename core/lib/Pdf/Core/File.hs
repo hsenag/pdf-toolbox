@@ -130,8 +130,7 @@ setUserPassword file password = message "setUserPassword" $ do
           Dict d -> return d
           Null -> throwIO (Corrupted "encryption encryption dict is null" [])
           _ -> throwIO (Corrupted "document Encrypt should be a dictionary" [])
-  let either_decryptor = mkStandardDecryptor tr enc
-        (ByteString.take 32 $ password `mappend` defaultUserPassword)
+  let either_decryptor = mkStandardDecryptor tr enc password
   case either_decryptor of
     Left err -> throwIO $ Corrupted err []
     Right Nothing -> return False
