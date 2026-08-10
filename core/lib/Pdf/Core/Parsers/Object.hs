@@ -126,17 +126,25 @@ parseString = do
           return (ds ++ repeat '0')
 
 -- | Parse hex string
+--
+-- White-space characters between the angle brackets are ignored, as
+-- required by the PDF spec (7.3.4.3 Hexadecimal Strings). If the final
+-- digit is missing (odd number of hex digits) it is assumed to be 0.
 parseHexString :: Parser ByteString
 parseHexString = do
   void $ P.char '<'
-  str <- many takeHex
+  digits <- many (skipHexSpace *> P.satisfy isHexDigit)
+  skipHexSpace
   void $ P.char '>'
-  return $ BS.pack str
+  return $ BS.pack (pairUp digits)
   where
-  takeHex = do
-    ch1 <- P.satisfy isHexDigit
-    ch2 <- P.satisfy isHexDigit
-    return $ fromIntegral $ digitToInt ch1 * 16 + digitToInt ch2
+  skipHexSpace = P.skipWhile isPdfSpace
+  isPdfSpace c = c == ' ' || c == '\n' || c == '\r'
+              || c == '\t' || c == '\f' || c == '\0'
+  pairUp [] = []
+  pairUp [a] = [fromIntegral (digitToInt a * 16)]
+  pairUp (a : b : rest) =
+    fromIntegral (digitToInt a * 16 + digitToInt b) : pairUp rest
 
 -- | Parse a reference
 parseRef :: Parser Ref
