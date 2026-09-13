@@ -239,10 +239,9 @@ loadFontDescriptor pdf fontDict = do
   case HashMap.lookup "FontDescriptor" fontDict of
     Nothing -> return Nothing
     Just o -> do
-      ref <- sure $ refValue o
-             `notice` "FontDescriptor should be a reference"
+      -- it is usually an indirect object, but it doesn't have to be
       fd <- (sure . (`notice` "FontDescriptor: not a dictionary") . dictValue) =<<
-            lookupObject pdf ref
+            deref pdf o
 
       fontName <- required "FontName" nameValue' fd
       fontFamily <- optional "FontFamily" stringValue fd
