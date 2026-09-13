@@ -115,18 +115,23 @@ pageFontDicts (Page pdf _ dict) =
       res' <- deref pdf res
       resDict <- sure $ dictValue res'
           `notice` "Resources should be a dictionary"
-      case HashMap.lookup "Font" resDict of
-        Nothing -> return []
-        Just fonts -> do
-          fonts' <- deref pdf fonts
-          fontsDict <- sure $ dictValue fonts'
-              `notice` "Font should be a dictionary"
-          forM (HashMap.toList fontsDict) $ \(name, font) -> do
-            font' <- deref pdf font
-            fontDict <- sure $ dictValue font'
-                `notice` "Each font should be a dictionary"
-            ensureType "Font" fontDict
-            return (name, FontDict pdf fontDict)
+      resourceFontDicts pdf resDict
+
+-- | Font dictionaries in a resource dictionary
+resourceFontDicts :: Pdf -> Dict -> IO [(Name, FontDict)]
+resourceFontDicts pdf resDict =
+  case HashMap.lookup "Font" resDict of
+    Nothing -> return []
+    Just fonts -> do
+      fonts' <- deref pdf fonts
+      fontsDict <- sure $ dictValue fonts'
+          `notice` "Font should be a dictionary"
+      forM (HashMap.toList fontsDict) $ \(name, font) -> do
+        font' <- deref pdf font
+        fontDict <- sure $ dictValue font'
+            `notice` "Each font should be a dictionary"
+        ensureType "Font" fontDict
+        return (name, FontDict pdf fontDict)
 
 data XObject = XObject
   { xobjectContent :: Lazy.ByteString
@@ -167,26 +172,7 @@ dictXObjects pdf dict =
 
             case HashMap.lookup "Subtype" xoDict of
               Just (Name "Form") -> do
-                is <- streamContent pdf ref s
-                cont <- Lazy.ByteString.fromChunks <$> Streams.toList is
-
-                fontDicts <- Map.fromList <$>
-                  pageFontDicts (Page pdf ref xoDict)
-
-                glyphDecoders <- Traversable.forM fontDicts $ \fontDict ->
-                  fontInfoDecodeGlyphs <$> fontDictLoadInfo fontDict
-                let glyphDecoder fontName = \str ->
-                      case Map.lookup fontName glyphDecoders of
-                        Nothing -> []
-                        Just decode -> decode str
-
-                children <- dictXObjects pdf xoDict
-
-                let xobj = XObject
-                      { xobjectContent = cont
-                      , xobjectGlyphDecoder = glyphDecoder
-                      , xobjectChildren = children
-                      }
+                xobj <- formXObject pdf ref s
                 return (name, Just xobj)
 
               _ -> return (name, Nothing)
@@ -194,6 +180,29 @@ dictXObjects pdf dict =
           return $ Map.fromList $ flip mapMaybe result $ \(n, mo) -> do
             o <- mo
             return (n, o)
+
+-- | A form XObject: its content, the fonts it draws with and the
+-- XObjects it in turn refers to
+formXObject :: Pdf -> Ref -> Stream -> IO XObject
+formXObject pdf ref s@(S dict _) = do
+  is <- streamContent pdf ref s
+  cont <- Lazy.ByteString.fromChunks <$> Streams.toList is
+
+  fontDicts <- Map.fromList <$> pageFontDicts (Page pdf ref dict)
+  glyphDecoders <- Traversable.forM fontDicts $ \fontDict ->
+    fontInfoDecodeGlyphs <$> fontDictLoadInfo fontDict
+  let glyphDecoder fontName = \str ->
+        case Map.lookup fontName glyphDecoders of
+          Nothing -> []
+          Just decode -> decode str
+
+  children <- dictXObjects pdf dict
+
+  return XObject
+    { xobjectContent = cont
+    , xobjectGlyphDecoder = glyphDecoder
+    , xobjectChildren = children
+    }
 
 -- | Extract text from the page
 --
@@ -221,33 +230,164 @@ pageExtractGlyphs page = do
     Streams.parserToInputStream parseContent is
 
   -- use content stream processor to extract text
-  let loop xobjs s p = do
-        next <- readNextOperator s
-        case next of
-          Just (Op_Do, [Name name]) -> processDo xobjs name p >>= loop xobjs s
-          Just op ->
-            case processOp op p of
-              Left err -> throwIO (Unexpected err [])
-              Right  p' -> loop xobjs s p'
-          Nothing -> return p
-
-      processDo xobjs name p = do
-        case Map.lookup name xobjs of
-          Nothing -> return p
-          Just xobj -> do
-            s <- do
-              s <- Streams.fromLazyByteString (xobjectContent xobj)
-              Streams.parserToInputStream parseContent s
-
-            let gdec' = prGlyphDecoder p
-            p' <- loop (xobjectChildren xobj) s
-              (p {prGlyphDecoder = xobjectGlyphDecoder xobj})
-            return (p' {prGlyphDecoder = gdec'})
-
-  p <- loop xobjects is $ mkProcessor {
+  p <- processContent xobjects is $ mkProcessor {
     prGlyphDecoder = glyphDecoder
     }
-  return (List.reverse (prSpans p))
+  annots <- pageAnnotationGlyphs page
+  return (List.reverse (prSpans p) ++ annots)
+
+-- | Run the content stream processor, stepping into the form XObjects
+-- that the content draws
+processContent :: Map Name XObject
+               -> InputStream Expr
+               -> Processor
+               -> IO Processor
+processContent xobjs s = loop
+  where
+  loop p = do
+    next <- readNextOperator s
+    case next of
+      Just (Op_Do, [Name name]) -> processDo name p >>= loop
+      Just op ->
+        case processOp op p of
+          Left err -> throwIO (Unexpected err [])
+          Right p' -> loop p'
+      Nothing -> return p
+
+  processDo name p =
+    case Map.lookup name xobjs of
+      Nothing -> return p
+      Just xobj -> do
+        s' <- Streams.fromLazyByteString (xobjectContent xobj)
+          >>= Streams.parserToInputStream parseContent
+        let gdec = prGlyphDecoder p
+        p' <- processContent (xobjectChildren xobj) s'
+          (p {prGlyphDecoder = xobjectGlyphDecoder xobj})
+        return (p' {prGlyphDecoder = gdec})
+
+{- | Glyphs drawn by the page's annotations
+
+The value of a form field is drawn by the appearance stream of its
+widget annotation, not by the page's own content stream.
+-}
+pageAnnotationGlyphs :: Page -> IO [Span]
+pageAnnotationGlyphs (Page pdf _ dict) =
+  case HashMap.lookup "Annots" dict of
+    Nothing -> return []
+    Just annots -> do
+      annots' <- deref pdf annots
+      case arrayValue annots' of
+        Nothing -> return []
+        Just arr -> concat <$> mapM (annotationGlyphs pdf) (Vector.toList arr)
+
+annotationGlyphs :: Pdf -> Object -> IO [Span]
+annotationGlyphs pdf annot = do
+  annot' <- deref pdf annot
+  case dictValue annot' of
+    Nothing -> return []
+    Just annotDict -> do
+      flags <- maybe (return 0) (fmap (fromMaybe 0 . intValue) . deref pdf)
+        (HashMap.lookup "F" annotDict)
+      if flags `div` hiddenFlag `mod` 2 == 1
+          || flags `div` noViewFlag `mod` 2 == 1
+        then return []
+        else do
+          appearance <- normalAppearance pdf annotDict
+          case appearance of
+            Nothing -> return []
+            Just (ref, s) -> appearanceGlyphs pdf annotDict ref s
+  where
+  hiddenFlag = 2
+  noViewFlag = 32
+
+-- | Glyphs drawn by an annotation's appearance stream
+appearanceGlyphs :: Pdf -> Dict -> Ref -> Stream -> IO [Span]
+appearanceGlyphs pdf annot ref s@(S apDict _) =
+  case (annotRectangle annot, bbox) of
+    (Just r, Just b) -> do
+      xobj <- formXObject pdf ref s
+      is <- Streams.fromLazyByteString (xobjectContent xobj)
+        >>= Streams.parserToInputStream parseContent
+      p <- processContent (xobjectChildren xobj) is mkProcessor
+        { prGlyphDecoder = xobjectGlyphDecoder xobj
+        , prState = initialGraphicsState
+          { gsCurrentTransformMatrix = appearanceTransform r b matrix
+          }
+        }
+      return (List.reverse (prSpans p))
+    _ -> return []
+  where
+  bbox = do
+    arr <- HashMap.lookup "BBox" apDict >>= arrayValue
+    either (const Nothing) Just (rectangleFromArray arr)
+  matrix = fromMaybe identity $ do
+    arr <- HashMap.lookup "Matrix" apDict >>= arrayValue
+    transformFromArray arr
+
+annotRectangle :: Dict -> Maybe (Rectangle Double)
+annotRectangle annot = do
+  arr <- HashMap.lookup "Rect" annot >>= arrayValue
+  either (const Nothing) Just (rectangleFromArray arr)
+
+-- | The appearance an annotation has when it is not being interacted with
+--
+-- It is either the appearance itself, or a dictionary of the
+-- appearances for the states the annotation can be in.
+normalAppearance :: Pdf -> Dict -> IO (Maybe (Ref, Stream))
+normalAppearance pdf annot =
+  case HashMap.lookup "AP" annot >>= dictValue of
+    Nothing -> return Nothing
+    Just appearances ->
+      case HashMap.lookup "N" appearances of
+        Nothing -> return Nothing
+        Just n -> do
+          appearance <- case refValue n of
+            Just ref -> return (Just ref)
+            Nothing -> do
+              n' <- deref pdf n
+              return $ do
+                states <- dictValue n'
+                state <- HashMap.lookup "AS" annot >>= nameValue
+                HashMap.lookup state states >>= refValue
+          case appearance of
+            Nothing -> return Nothing
+            Just ref -> do
+              o <- lookupObject pdf ref
+              return ((,) ref <$> streamValue o)
+
+{- | Where to draw an appearance stream
+
+Its bounding box, transformed by its matrix, is mapped onto the
+rectangle of the annotation it belongs to.
+-}
+appearanceTransform :: Rectangle Double
+                    -- ^ the annotation's rectangle
+                    -> Rectangle Double
+                    -- ^ the appearance's bounding box
+                    -> Transform Double
+                    -- ^ the appearance's matrix
+                    -> Transform Double
+appearanceTransform rect bbox matrix = matrix `multiply` fit
+  where
+  Rectangle rx1 ry1 rx2 ry2 = rect
+  Rectangle bx1 by1 bx2 by2 = bbox
+  corners = [transform matrix (Vector x y)
+            | x <- [bx1, bx2], y <- [by1, by2]]
+  xs = [x | Vector x _ <- corners]
+  ys = [y | Vector _ y <- corners]
+  (tx1, tx2) = (minimum xs, maximum xs)
+  (ty1, ty2) = (minimum ys, maximum ys)
+  ratio from to = if from == 0 then 1 else to / from
+  sx = ratio (tx2 - tx1) (abs (rx2 - rx1))
+  sy = ratio (ty2 - ty1) (abs (ry2 - ry1))
+  fit = scale sx sy
+    `multiply` translation (min rx1 rx2 - sx * tx1) (min ry1 ry2 - sy * ty1)
+
+transformFromArray :: Array -> Maybe (Transform Double)
+transformFromArray arr =
+  case mapM realValue (Vector.toList arr) of
+    Just [a, b, c, d, e, f] -> Just (Transform a b c d e f)
+    _ -> Nothing
 
 combinedContent :: Pdf -> [Ref] -> IO (InputStream ByteString)
 combinedContent pdf refs = do
