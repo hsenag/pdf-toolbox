@@ -98,26 +98,30 @@ buildFilterList dict = do
     (Name fd, Null) -> return [(fd, Nothing)]
     (Name fd, Dict pd) -> return [(fd, Just pd)]
     (Name fd, Array arr)
-      | [Dict pd] <- Vector.toList arr
-      -> return [(fd, Just pd)]
+      | [params] <- Vector.toList arr
+      -> do
+        pd <- decodeParms params
+        return [(fd, pd)]
     (Array fa, Null) -> do
-      fa' <- forM (Vector.toList fa) $ \o ->
-        case o of
-          Name n -> return n
-          _ -> throwIO $ Corrupted ("Filter should be a Name") []
+      fa' <- forM (Vector.toList fa) filterName'
       return $ zip fa' (repeat Nothing)
     (Array fa, Array pa) | Vector.length fa == Vector.length pa -> do
-      fa' <- forM (Vector.toList fa) $ \o ->
-        case o of
-          Name n -> return n
-          _ -> throwIO $ Corrupted ("Filter should be a Name") []
-      pa' <- forM (Vector.toList pa) $ \o ->
-        case o of
-          Dict d -> return d
-          _ -> throwIO $ Corrupted ("DecodeParams should be a dictionary") []
-      return $ zip fa' (map Just pa')
+      fa' <- forM (Vector.toList fa) filterName'
+      pa' <- forM (Vector.toList pa) decodeParms
+      return $ zip fa' pa'
     _ -> throwIO $ Corrupted ("Can't handle Filter and DecodeParams: ("
                             ++ show f ++ ", " ++ show p ++ ")") []
+  where
+  filterName' (Name n) = return n
+  filterName' _ = throwIO $ Corrupted ("Filter should be a Name") []
+
+  -- "If there is only one filter and that filter has no parameters, or
+  -- if all of the filters have no parameters, DecodeParms shall be
+  -- omitted. ... If any of the filters have no parameters, null may be
+  -- used in place of that filter's parameter dictionary"
+  decodeParms (Dict d) = return (Just d)
+  decodeParms Null = return Nothing
+  decodeParms _ = throwIO $ Corrupted ("DecodeParams should be a dictionary") []
 
 -- | Decoded stream content
 --
