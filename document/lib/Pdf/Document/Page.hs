@@ -28,8 +28,15 @@ import Pdf.Document.FontDict
 import Pdf.Document.Internal.Types
 import Pdf.Document.Internal.Util
 
+import Control.Applicative ((<|>))
 import Data.Maybe
 import qualified Data.List as List
+import qualified Data.ByteString as ByteString
+import qualified Data.ByteString.Char8 as Char8
+import qualified Pdf.Core.Name as Name
+import Pdf.Document.Document (documentCatalog)
+import Text.Printf (printf)
+import Text.Read (readMaybe)
 import qualified Data.Traversable as Traversable
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as Lazy (ByteString)
@@ -132,6 +139,17 @@ resourceFontDicts pdf resDict =
             `notice` "Each font should be a dictionary"
         ensureType "Font" fontDict
         return (name, FontDict pdf fontDict)
+
+-- | Glyph decoder for the fonts in a resource dictionary
+resourceGlyphDecoder :: Pdf -> Dict -> IO GlyphDecoder
+resourceGlyphDecoder pdf resDict = do
+  fontDicts <- Map.fromList <$> resourceFontDicts pdf resDict
+  glyphDecoders <- Traversable.forM fontDicts $ \fontDict ->
+    fontInfoDecodeGlyphs <$> fontDictLoadInfo fontDict
+  return $ \fontName str ->
+    case Map.lookup fontName glyphDecoders of
+      Nothing -> []
+      Just decode -> decode str
 
 data XObject = XObject
   { xobjectContent :: Lazy.ByteString
@@ -293,9 +311,12 @@ annotationGlyphs pdf annot = do
         then return []
         else do
           appearance <- normalAppearance pdf annotDict
-          case appearance of
+          drawn <- case appearance of
             Nothing -> return []
             Just (ref, s) -> appearanceGlyphs pdf annotDict ref s
+          if null drawn
+            then fieldValueGlyphs pdf annotDict
+            else return drawn
   where
   hiddenFlag = 2
   noViewFlag = 32
@@ -328,6 +349,95 @@ annotRectangle :: Dict -> Maybe (Rectangle Double)
 annotRectangle annot = do
   arr <- HashMap.lookup "Rect" annot >>= arrayValue
   either (const Nothing) Just (rectangleFromArray arr)
+
+{- | Glyphs for the value of a form field that isn't drawn anywhere
+
+A document with NeedAppearances set leaves it to whoever displays it to
+draw the values of its fields, so there is nothing to extract from the
+appearance streams. Lay the value out in the field's rectangle, in the
+font its default appearance asks for, so that it can be read along with
+the rest of the page.
+
+Only the common case is handled: a single line of text, left aligned,
+in a font the form's resources name.
+-}
+fieldValueGlyphs :: Pdf -> Dict -> IO [Span]
+fieldValueGlyphs pdf annot = do
+  value <- inherited pdf "V" annot
+  defaultAppearance <- inherited pdf "DA" annot
+  form <- acroFormDict pdf
+  formAppearance <- case form >>= HashMap.lookup "DA" of
+    Nothing -> return Nothing
+    Just o -> Just <$> deref pdf o
+  resources <- case form >>= HashMap.lookup "DR" of
+    Nothing -> return Nothing
+    Just o -> dictValue <$> deref pdf o
+  let da = (defaultAppearance <|> formAppearance) >>= stringValue
+  case (value >>= stringValue, annotRectangle annot, da, resources) of
+    (Just text, Just rect, Just da', Just res)
+      | not (ByteString.null text)
+      , Just (font, size) <- defaultFont da' rect -> do
+        let Rectangle x1 y1 _ y2 = rect
+            baseline = min y1 y2 + (abs (y2 - y1) - size) / 2 + size / 5
+            content = Lazy.ByteString.fromStrict $ ByteString.concat
+              [ "BT /", Name.toByteString font, " ", num size, " Tf 1 0 0 1 "
+              , num (x1 + 2), " ", num baseline, " Tm <", hex text, "> Tj ET"
+              ]
+        glyphDecoder <- resourceGlyphDecoder pdf res
+        is <- Streams.fromLazyByteString content
+          >>= Streams.parserToInputStream parseContent
+        p <- processContent Map.empty is mkProcessor
+          {prGlyphDecoder = glyphDecoder}
+        return (List.reverse (prSpans p))
+    _ -> return []
+  where
+  num :: Double -> ByteString
+  num = Char8.pack . show
+  hex = ByteString.concatMap $ \w ->
+    Char8.pack (printf "%02X" w)
+
+-- | The value of a key on a field, or on the field it descends from
+inherited :: Pdf -> Name -> Dict -> IO (Maybe Object)
+inherited = go (10 :: Int)
+  where
+  go 0 _ _ _ = return Nothing
+  go depth pdf key dict =
+    case HashMap.lookup key dict of
+      Just o -> Just <$> deref pdf o
+      Nothing ->
+        case HashMap.lookup "Parent" dict of
+          Nothing -> return Nothing
+          Just p -> do
+            p' <- deref pdf p
+            case dictValue p' of
+              Nothing -> return Nothing
+              Just parent -> go (depth - 1) pdf key parent
+
+-- | The interactive form of the document, if it has one
+acroFormDict :: Pdf -> IO (Maybe Dict)
+acroFormDict pdf = do
+  doc <- document pdf
+  Catalog _ _ catalog <- documentCatalog doc
+  case HashMap.lookup "AcroForm" catalog of
+    Nothing -> return Nothing
+    Just o -> dictValue <$> deref pdf o
+
+{- | The font a field's default appearance asks for
+
+It is a fragment of a content stream, like @\/Helv 9 Tf 0 g@. A size of
+zero means the text is scaled to fit the field.
+-}
+defaultFont :: ByteString -> Rectangle Double -> Maybe (Name, Double)
+defaultFont da (Rectangle _ y1 _ y2) =
+  case break (== "Tf") (reverse (Char8.words da)) of
+    (_, _ : sizeWord : fontWord : _) -> do
+      font <- either (const Nothing) Just . Name.make
+        =<< ByteString.stripPrefix "/" fontWord
+      size <- readMaybe (Char8.unpack sizeWord)
+      return (font, if size > 0 then size else autoSize)
+    _ -> Nothing
+  where
+  autoSize = abs (y2 - y1) * 2 / 3
 
 -- | The appearance an annotation has when it is not being interacted with
 --
