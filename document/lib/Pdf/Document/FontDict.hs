@@ -130,19 +130,24 @@ loadFontInfoSimple pdf fontDict = do
 
   encoding <-
     case HashMap.lookup "Encoding" fontDict of
-      Just (Name "WinAnsiEncoding") -> return $ Just SimpleFontEncoding
-        { simpleFontBaseEncoding = FontBaseEncodingWinAnsi
-        , simpleFontDifferences = []
-        }
-      Just (Name "MacRomanEncoding") -> return $ Just SimpleFontEncoding
-        { simpleFontBaseEncoding = FontBaseEncodingMacRoman
-        , simpleFontDifferences = []
-        }
+      Nothing -> return Nothing
       Just o -> do
-        o' <- deref pdf o
-        encDict <- sure (dictValue o'
-                      `notice` "Encoding should be a dictionary")
-        case HashMap.lookup "BaseEncoding" encDict of
+       -- the Encoding may be a base encoding name rather than a dictionary,
+       -- and either form may be an indirect object
+       o' <- deref pdf o
+       case o' of
+        Name "WinAnsiEncoding" -> return $ Just SimpleFontEncoding
+          { simpleFontBaseEncoding = FontBaseEncodingWinAnsi
+          , simpleFontDifferences = []
+          }
+        Name "MacRomanEncoding" -> return $ Just SimpleFontEncoding
+          { simpleFontBaseEncoding = FontBaseEncodingMacRoman
+          , simpleFontDifferences = []
+          }
+        _ -> do
+         encDict <- sure (dictValue o'
+                       `notice` "Encoding should be a dictionary")
+         case HashMap.lookup "BaseEncoding" encDict of
           Just (Name "WinAnsiEncoding") -> do
             diffs <- loadEncodingDifferences pdf encDict
             return $ Just SimpleFontEncoding
@@ -163,7 +168,6 @@ loadFontInfoSimple pdf fontDict = do
               , simpleFontDifferences = diffs
               }
           _ -> return Nothing
-      _ -> return Nothing
 
   widths <-
     case HashMap.lookup "Widths" fontDict of
