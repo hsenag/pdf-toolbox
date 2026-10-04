@@ -68,10 +68,70 @@ lastXRef :: Buffer -> IO XRef
 lastXRef buf = do
   sz <- Buffer.size buf
   Buffer.seek buf $ max 0 (sz - 1024)
-  (Streams.parseFromStream startXRef (Buffer.toInputStream buf)
-    >>= readXRef buf
-    ) `catch` \(Streams.ParseException msg) ->
+  off <- Streams.parseFromStream startXRef (Buffer.toInputStream buf)
+    `catch` \(Streams.ParseException msg) ->
                   throwIO (Corrupted "lastXRef" [msg])
+  readXRef buf off `catches`
+    [ Handler $ \e@Corrupted{} -> recover off e
+    , Handler $ \(Streams.ParseException msg) ->
+                  recover off (Corrupted "lastXRef" [msg])
+    ]
+  where
+  -- Some producers write a startxref offset that doesn't point at the xref.
+  -- SAP's RSTXPDF, for example, gets it wrong by the length of a comment it
+  -- adds to the header, even though the offsets within the table are right.
+  -- Fall back to searching the file for the xref keyword.
+  recover off e = do
+    found <- searchXRefTable buf
+    case found of
+      Just off' | off' /= off -> readXRef buf off'
+      _ -> throwIO e
+
+-- | Offset of the last @xref@ keyword that starts a line, if there is one
+searchXRefTable :: Buffer -> IO (Maybe Int64)
+searchXRefTable buf =
+  -- only recognise the keyword at the start of a line, which also stops the
+  -- "xref" inside "startxref" from matching
+  fmap (fmap (+ 1)) (lastOccurrence buf ["\nxref", "\rxref"])
+
+-- | Offset of the last occurrence of any of the needles in the whole file
+lastOccurrence :: Buffer -> [ByteString] -> IO (Maybe Int64)
+lastOccurrence buf needles = do
+  Buffer.seek buf 0
+  go 0 ByteString.empty Nothing
+  where
+  -- carrying this many bytes over to the next chunk is enough for a match
+  -- that straddles the boundary to still be found
+  overlap = maximum (1 : map ByteString.length needles) - 1
+
+  go base prefix found = do
+    chunk <- Buffer.read buf
+    case chunk of
+      Nothing -> return found
+      Just bs -> do
+        let haystack = prefix `ByteString.append` bs
+            hits = concatMap (`substringOffsets` haystack) needles
+            -- any hit here is later in the file than anything found so far
+            found' =
+              case hits of
+                [] -> found
+                _ -> Just (base + fromIntegral (maximum hits))
+            keep = min (ByteString.length haystack) overlap
+            consumed = ByteString.length haystack - keep
+        go (base + fromIntegral consumed)
+           (ByteString.drop consumed haystack)
+           found'
+
+-- | Offsets of every occurrence of the first bytestring in the second
+substringOffsets :: ByteString -> ByteString -> [Int]
+substringOffsets needle = go 0
+  where
+  go base hay =
+    let (before, rest) = ByteString.breakSubstring needle hay
+    in if ByteString.null rest
+         then []
+         else let off = base + ByteString.length before
+              in off : go (off + 1) (ByteString.drop 1 rest)
 
 -- | Read XRef at specified offset
 readXRef :: Buffer -> Int64 -> IO XRef
