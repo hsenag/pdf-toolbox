@@ -9,6 +9,7 @@ module Pdf.Core.XRef
   Entry(..),
   readXRef,
   lastXRef,
+  searchObjectOffset,
   prevXRef,
   trailer,
   lookupTableEntry,
@@ -31,6 +32,7 @@ import Data.Typeable
 import Data.Int
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
+import qualified Data.ByteString.Char8 as Char8
 import qualified Data.Vector as Vector
 import qualified Data.HashMap.Strict as HashMap
 import Control.Monad
@@ -93,6 +95,17 @@ searchXRefTable buf =
   -- only recognise the keyword at the start of a line, which also stops the
   -- "xref" inside "startxref" from matching
   fmap (fmap (+ 1)) (lastOccurrence buf ["\nxref", "\rxref"])
+
+-- | Offset of the last definition of the indirect object, found by scanning
+-- the file for its @N G obj@ header, if there is one
+--
+-- Used to recover from an offset in the xref that is wrong.
+searchObjectOffset :: Buffer -> Ref -> IO (Maybe Int64)
+searchObjectOffset buf (R index gen) =
+  fmap (fmap (+ 1)) (lastOccurrence buf (map (`ByteString.append` header)
+                                             ["\n", "\r"]))
+  where
+  header = Char8.pack (show index ++ " " ++ show gen ++ " obj")
 
 -- | Offset of the last occurrence of any of the needles in the whole file
 lastOccurrence :: Buffer -> [ByteString] -> IO (Maybe Int64)

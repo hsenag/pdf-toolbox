@@ -24,7 +24,7 @@ import Data.ByteString (ByteString)
 import Data.IORef
 import qualified Data.HashMap.Strict as HashMap
 import Control.Monad
-import Control.Exception (Exception, throwIO, catch)
+import Control.Exception (Exception, throwIO, catch, try)
 import System.IO (Handle)
 import qualified System.IO as IO
 import System.IO.Streams (InputStream)
@@ -60,7 +60,7 @@ findObject file ref = do
     `catch` \(UnknownXRefStreamEntryType _) -> return Nothing
   case mentry of
     Nothing -> return Null
-    Just entry -> readObjectForEntry file entry
+    Just entry -> readObjectForEntry file ref entry
 
 -- | Get content of the stream
 --
@@ -207,18 +207,34 @@ lookupEntry file ref (XRefStream _ s@(S dict _)) = do
   content <- streamContent file ref s
   lookupStreamEntry dict content ref
 
-readObjectForEntry :: File -> Entry -> IO Object
+readObjectForEntry :: File -> Ref -> Entry -> IO Object
 
-readObjectForEntry _ EntryFree{} = return Null
+readObjectForEntry _ _ EntryFree{} = return Null
 
-readObjectForEntry file (EntryUsed off gen) = do
-  (ref, obj) <- readObjectAtOffset (fileBuffer file) off
+readObjectForEntry file wanted (EntryUsed off gen) = do
+  res <- try (readObjectAtOffset buf off)
+          :: IO (Either Corrupted (Ref, Object))
+  (ref, obj) <-
+    case res of
+      Right r@(R index _, _) | index == wantedIndex -> return r
+      _ -> do
+        -- The offset in the xref can be wrong, either failing to parse or
+        -- landing on some other object: SAP's RSTXPDF, for example, gets a
+        -- few of them out by the length of a comment it adds to the header.
+        -- Search the file for the object before giving up.
+        found <- searchObjectOffset buf wanted
+        case found of
+          Just off' -> readObjectAtOffset buf off'
+          Nothing -> either throwIO return res
   let R _ gen' = ref
   unless (gen' == gen) $
     throwIO (Corrupted "readObjectForEntry" ["object generation missmatch"])
   decrypt file ref obj
+  where
+  buf = fileBuffer file
+  R wantedIndex _ = wanted
 
-readObjectForEntry file (EntryCompressed index num) = do
+readObjectForEntry file _ (EntryCompressed index num) = do
   let ref= R index 0
   objStream@(S dict _) <- do
     o <- findObject file ref
