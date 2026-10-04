@@ -21,7 +21,6 @@ module Pdf.Core.File
 where
 
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as ByteString
 import Data.IORef
 import qualified Data.HashMap.Strict as HashMap
 import Control.Monad
