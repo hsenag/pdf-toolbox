@@ -44,6 +44,7 @@ library
                        text,
                        scientific,
                        vector,
+                       unordered-containers,
                        io-streams,
                        pdf-toolbox-core ==0.1.*
   if impl(ghc >= 8.10)
@@ -58,10 +59,14 @@ test-suite test
   other-modules:       Test.UnicodeCMap
                        Test.Parser
                        Test.FontDescriptor
+                       Test.Processor
                        Prelude
   build-depends:       base,
                        containers,
                        bytestring,
+                       text,
+                       unordered-containers,
+                       vector,
                        attoparsec,
                        io-streams,
                        pdf-toolbox-content,

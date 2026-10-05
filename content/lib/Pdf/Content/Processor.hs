@@ -11,6 +11,7 @@ module Pdf.Content.Processor
   GlyphDecoder,
   Glyph(..),
   Span(..),
+  MarkedContent(..),
   initialGraphicsState,
   mkProcessor,
   processOp
@@ -23,9 +24,17 @@ import Pdf.Core.Util
 
 import Pdf.Content.Ops
 import Pdf.Content.Transform
+import qualified Pdf.Content.Encoding.PdfDoc as PdfDoc
 
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
 import Data.Text (Text)
+import qualified Data.Text as Text
+import qualified Data.Text.Encoding as Text
+import qualified Data.Text.Encoding.Error as Text
+import qualified Data.HashMap.Strict as HashMap
+import qualified Data.Map as Map
+import Data.Maybe (mapMaybe)
 import qualified Data.Scientific as Scientific
 import qualified Data.Vector as Vector
 import Control.Monad
@@ -91,13 +100,33 @@ data Span = Span
   , spFontName :: Name
   }
 
+-- | A marked content section, begun by BMC or BDC and ended by EMC
+--
+-- A BDC section's properties can give an @ActualText@, which replaces
+-- the text of everything drawn inside it. That is how a document says
+-- what characters a glyph stands for when its font can't: headless
+-- Chrome, for one, gives many of its fonts a ToUnicode map that sends
+-- every code to U+0000 and puts the real text in an ActualText around
+-- each glyph.
+data MarkedContent
+  = PlainContent
+  -- ^ The section has no ActualText
+  | ActualText Text
+  -- ^ The section's ActualText, which no glyph has been given yet
+  | ActualTextGiven
+  -- ^ The section's ActualText has been given to its first glyph, so
+  -- any others drawn in it have no text
+  deriving (Eq, Show)
+
 -- | Processor maintains graphics state
 data Processor = Processor {
   prState :: GraphicsState,
   prStateStack :: [GraphicsState],
   prGlyphDecoder :: GlyphDecoder,
-  prSpans :: [Span]
+  prSpans :: [Span],
   -- ^ Each element is a list of glyphs, drawn in one shot
+  prMarkedContent :: [MarkedContent]
+  -- ^ The marked content sections being drawn in, innermost first
   }
 
 -- | Create processor in initial state
@@ -106,7 +135,8 @@ mkProcessor = Processor {
   prState = initialGraphicsState,
   prStateStack = [],
   prGlyphDecoder = \_ _ -> [],
-  prSpans = mempty
+  prSpans = mempty,
+  prMarkedContent = []
   }
 
 -- | Process one operation
@@ -240,12 +270,14 @@ processOp (Op_Tj, [String str]) p = do
                        (gsTextCharSpacing gstate)
                        (gsTextWordSpacing gstate)
                        (prGlyphDecoder p fontName str)
-  let sp = Span
-        { spGlyphs = glyphs
+  let (glyphs', marked) = actualText (prMarkedContent p) [glyphs]
+      sp = Span
+        { spGlyphs = concat glyphs'
         , spFontName = fontName
         }
   return p {
     prSpans = sp : prSpans p,
+    prMarkedContent = marked,
     prState = gstate {
       gsTextMatrix = tm
       }
@@ -280,12 +312,14 @@ processOp (Op_TJ, [Array array]) p = do
           in loop (translate (-d * fontSize / 1000) 0 tm) res rest
         loop tm res (_:rest) = loop tm res rest
 
-  let mkSpan gs = Span
+  let (glyphs', marked) = actualText (prMarkedContent p) glyphs
+      mkSpan gs = Span
         { spGlyphs = gs
         , spFontName = fontName
         }
   return p {
-    prSpans = reverse (map mkSpan glyphs) ++ prSpans p,
+    prSpans = reverse (map mkSpan glyphs') ++ prSpans p,
+    prMarkedContent = marked,
     prState = gstate {
       gsTextMatrix = textMatrix
       }
@@ -321,7 +355,67 @@ processOp (Op_apostrophe, [o]) p = do
 processOp (Op_apostrophe, args) _ =
   Left ("Op_apostrophe: wrong number of agruments:" ++ show args)
 
+processOp (Op_BMC, [_]) p =
+  return p {prMarkedContent = PlainContent : prMarkedContent p}
+processOp (Op_BMC, args) _ = Left ("Op_BMC: wrong number of agruments:"
+                                   ++ show args)
+
+-- The properties can also be the name of an entry in the Properties of
+-- the resources, which the processor can't see, so only the ActualText
+-- of a dictionary given inline is used
+processOp (Op_BDC, [_, props]) p =
+  let section =
+        case props of
+          Dict d | Just (String t) <- HashMap.lookup "ActualText" d
+            -> ActualText (decodeTextString t)
+          _ -> PlainContent
+  in return p {prMarkedContent = section : prMarkedContent p}
+processOp (Op_BDC, args) _ = Left ("Op_BDC: wrong number of agruments:"
+                                   ++ show args)
+
+-- An EMC without a section to end is ignored, rather than failing the
+-- whole page
+processOp (Op_EMC, []) p =
+  return p {prMarkedContent = drop 1 (prMarkedContent p)}
+processOp (Op_EMC, args) _ = Left ("Op_EMC: wrong number of agruments:"
+                                   ++ show args)
+
 processOp _ p = return p
+
+-- | Give the glyphs drawn in one operator the ActualText of the
+-- outermost section that has one, which replaces anything inside it.
+--
+-- The text goes to the first glyph the section draws, and the rest
+-- have none, so that it is extracted once and where the section
+-- starts.
+actualText :: [MarkedContent] -> [[Glyph]] -> ([[Glyph]], [MarkedContent])
+actualText marked gss =
+  case break (/= PlainContent) (reverse marked) of
+    (_, []) -> (gss, marked)
+    (outer, section : inner) ->
+      let (gss', section') = give section gss
+      in (gss', reverse (outer ++ section' : inner))
+  where
+  give section [] = ([], section)
+  give section ([] : rest) =
+    let (rest', section') = give section rest
+    in ([] : rest', section')
+  give section ((g : gs) : rest) =
+    let text = case section of
+          ActualText t -> Just t
+          _ -> Nothing
+        noText g' = g' {glyphText = Nothing}
+    in ((g {glyphText = text} : map noText gs) : map (map noText) rest,
+        ActualTextGiven)
+
+-- | Decode a text string, which is UTF-16BE if it starts with a byte
+-- order mark and PDFDocEncoding otherwise
+decodeTextString :: ByteString -> Text
+decodeTextString bs =
+  case ByteString.stripPrefix "\254\255" bs of
+    Just rest -> Text.decodeUtf16BEWith Text.lenientDecode rest
+    Nothing -> Text.concat $
+      mapMaybe (`Map.lookup` PdfDoc.encoding) (ByteString.unpack bs)
 
 ensureInTextObject :: Bool -> Processor -> Either String ()
 ensureInTextObject inText p =
